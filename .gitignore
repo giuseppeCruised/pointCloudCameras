@@ -1,0 +1,74 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# Virtual environments
+.env/
+.venv/
+myenv/
+env/
+venv/
+pip-wheel-metadata/
+*.egg-info/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Logs & system files
+*.log
+.DS_Store
+Thumbs.db
+tmp_logs/
+
+# IDEs
+.vscode/
+.idea/
+
+# Checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+checkpoints/
+models/
+outputs/
+runs/
+
+# Data
+data/
+train/
+test/
+*.npz
+*.npy
+*.json
+
+# WandB / experiment artifacts
+wandb/
+wandb-old/
+*.wandb
+
+# Notebooks and rendered outputs
+*.ipynb
+*.html
+
+# If using poetry or pipenv
+poetry.lock
+Pipfile.lock
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.~*
+
+# Optional: ignore dotfiles
+.*.swp
+*.swo
+
+# Node/NPM stuff (just in case)
+node_modules/
+
+# VS Code Workspace (if shared)
+*.code-workspace
