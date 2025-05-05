@@ -5,13 +5,13 @@ import random
 
 # --- Shape Creation Functions ---
 
-def create_sphere_mesh(radius=1.0):
+def create_sphere_mesh(radius=0.4):
     """Creates an open3d sphere mesh."""
     mesh = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
     mesh.compute_vertex_normals()
     return mesh
 
-def create_cube_mesh(width=2.0, height=2.0, depth=2.0):
+def create_cube_mesh(width=0.6, height=0.6, depth=0.6):
     """Creates an open3d cube mesh centered at origin."""
     mesh = o3d.geometry.TriangleMesh.create_box(width=width, height=height, depth=depth)
     # Center the mesh at the origin
@@ -19,13 +19,13 @@ def create_cube_mesh(width=2.0, height=2.0, depth=2.0):
     mesh.compute_vertex_normals()
     return mesh
 
-def create_cylinder_mesh(radius=1.0, height=2.0):
+def create_cylinder_mesh(radius=0.4, height=0.8):
     """Creates an open3d cylinder mesh."""
     mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=height)
     mesh.compute_vertex_normals()
     return mesh
 
-def create_pyramid_mesh(base_size=2.0, height=1.5):
+def create_pyramid_mesh(base_size=0.8, height=0.7):
     """Creates an open3d pyramid mesh with a square base centered at origin."""
     half_base = base_size / 2.0
     vertices = [
@@ -90,7 +90,7 @@ def generate_scene(num_points_in_scene, random_seed=None, dense_sampling_factor=
     surface_areas = []
 
     # 1. Randomly select and create 4 shapes
-    for _ in range(4):
+    for _ in range(2):
         shape_name = random.choice(SHAPE_NAMES)
         creator_func, label = SHAPE_GENERATORS[shape_name]
 
@@ -99,7 +99,7 @@ def generate_scene(num_points_in_scene, random_seed=None, dense_sampling_factor=
         mesh = creator_func()
 
         # Apply random translation
-        translation = np.random.uniform(-4, 4, size=3) # Translate within a -4 to 4 box
+        translation = np.random.uniform(-0.7, 0.7, size=3) # Translate within a -4 to 4 box
         mesh.translate(translation)
 
         area = mesh.get_surface_area()
@@ -171,6 +171,10 @@ def generate_scene(num_points_in_scene, random_seed=None, dense_sampling_factor=
     final_points = final_points[shuffle_idx]
     final_labels = final_labels[shuffle_idx]
 
+    # Center the scene at origin
+    center = final_points.mean(axis=0)
+    final_points -= center
+
     return final_points, final_labels
 
 # --- Dataset Generation Function ---
@@ -205,7 +209,7 @@ def main():
     # Hardcoded parameters
     NUM_TRAIN_SCENES = 256  # Number of training scenes
     NUM_TEST_SCENES = 20   # Number of testing scenes
-    NUM_POINTS_PER_SCENE = 2048 # Target number of points per scene
+    NUM_POINTS_PER_SCENE = 256 # Target number of points per scene
     TRAIN_DIR = "train_random_shapes"
     TEST_DIR = "test_random_shapes"
 

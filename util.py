@@ -3,8 +3,214 @@ import os
 import json
 import numpy as np
 import wandb
+import math
 
 from torch_cluster import knn_graph
+
+
+
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def look_at_R(cam_pos: torch.Tensor) -> torch.Tensor:
+    """
+    cam_pos : (3,) xyz position of the camera in world coordinates.
+    Returns a 3×3 rotation matrix whose -Z axis looks at the origin and whose
+    +Y is as “up” as possible.
+    """
+    z_axis = cam_pos / cam_pos.norm()               # forward (camera -Z)
+    up_tmp = torch.tensor([0., 1., 0.], device=cam_pos.device)
+    # In the rare case forward collinear with up_tmp, pick another up
+    if torch.abs(torch.dot(z_axis, up_tmp)) > 0.999:
+        up_tmp = torch.tensor([0., 0., 1.], device=cam_pos.device)
+
+    x_axis = torch.cross(up_tmp, z_axis)
+    x_axis = x_axis / x_axis.norm()
+    y_axis = torch.cross(z_axis, x_axis)
+    R = torch.stack([x_axis, y_axis, z_axis], dim=1)  # columns = basis vecs
+    return R
+
+def rotmat_to_axis_angle(R: torch.Tensor) -> torch.Tensor:
+    """
+    R : (3,3) rotation matrix  →  (3,) axis‑angle (Lie algebra so(3))
+    """
+    cos_theta = (torch.trace(R) - 1) / 2
+    cos_theta = torch.clamp(cos_theta, -1 + 1e-6, 1 - 1e-6)
+    theta = torch.acos(cos_theta)
+    axis = torch.tensor([
+        R[2,1]-R[1,2],
+        R[0,2]-R[2,0],
+        R[1,0]-R[0,1]
+    ], device=R.device) / (2*torch.sin(theta))
+    return axis * theta
+
+# ------------------------------------------------------------------
+# Main initialiser
+# ------------------------------------------------------------------
+
+
+def init_clustered_cameras(num_views: int,
+                           obj_radius: float = 1,
+                           cam_distance: float = 0.001,
+                           cluster_std_deg: float = 10.0,
+                           device="cpu"):
+    """
+    Returns:
+      rot_vecs : (N,3)  axis‑angle vectors  (requires_grad=True later)
+      trans    : (N,3)  camera centres     (requires_grad=True later)
+      f_init   : (N,)   focal lengths
+    """
+    #
+    # # ---- pick a “mean” viewing direction on the sphere -------------
+    # mean_dir = torch.randn(3, device=device)
+    # mean_dir = mean_dir / mean_dir.norm()
+    #
+    # # ---- sample N directions near that mean ------------------------
+    # std_rad = math.radians(cluster_std_deg)
+    # dirs = []
+    # for _ in range(num_views):
+    #     # tangential Gaussian perturbation
+    #     tangent = torch.randn(3, device=device)
+    #     tangent -= (tangent @ mean_dir) * mean_dir      # remove radial part
+    #     tangent = tangent / tangent.norm() * std_rad
+    #     v = mean_dir + tangent
+    #     v = v / v.norm()
+    #     dirs.append(v)
+    # dirs = torch.stack(dirs, dim=0)                     # (N,3)
+    #
+    # # ---- camera centres -------------------------------------------
+    # centres = dirs * cam_distance * obj_radius          # (N,3)
+    #
+    # # ---- rotations (look‑at) --------------------------------------
+    # R_all = torch.stack([look_at_R(c) for c in centres], dim=0)  # (N,3,3)
+    # rot_vecs = torch.stack([rotmat_to_axis_angle(R) for R in R_all], dim=0)
+    #
+    # # ---- focal length initial guess -------------------------------
+    # f_init = torch.full((num_views,), 1.0, device=device)
+    # ---- fixed predefined camera directions ------------------------
+    # return rot_vecs, centres, f_init
+    # ---- 8 fixed cameras in a ring around the origin --------------------
+    # Slight phase shift (e.g. π/16) to avoid alignment with axes
+    phase_shift = math.pi / 16
+    angle_step = 2 * math.pi / 8
+    tilt = 0.1  # small positive Z value so cams are slightly above the XY plane
+
+    dirs = []
+    for i in range(8):
+        angle = i * angle_step + phase_shift
+        x = math.cos(angle)
+        y = math.sin(angle)
+        z = tilt
+        vec = torch.tensor([x, y, z], dtype=torch.float32, device=device)
+        dirs.append(vec / vec.norm())
+
+    dirs = torch.stack(dirs, dim=0)  # (8,3)
+
+    # ---- camera centres -------------------------------------------
+    centres = dirs * cam_distance * obj_radius * 0.8  # (8,3)
+
+    # ---- rotations (look‑at) --------------------------------------
+    R_all = torch.stack([look_at_R(c) for c in centres], dim=0)  # (8,3,3)
+    rot_vecs = torch.stack([rotmat_to_axis_angle(R) for R in R_all], dim=0)  # (8,3)
+
+    # ---- hardcoded focal length -----------------------------------
+    f_init = torch.full((8,), 0.8, device=device)
+
+    return rot_vecs, centres, f_init
+
+
+def log_camera_images(
+        heatmaps: torch.Tensor,        # (B, K, H, W)  –  single‑channel floats
+        rgb_feats: torch.Tensor,       # (B, K, 3, H, W)
+        step: int,
+        prefix: str = "train"          # "val", "test", … if you like
+):
+    """
+    Logs to W&B:
+      • `{prefix}/heatmaps` – list of K grayscale wandb.Image objects
+      • `{prefix}/rgb`      – list of K RGB wandb.Image objects
+
+    Only the first element in the batch (index 0) is visualised.
+    """
+
+    # ---- sanity ----------------------------------------------------
+    assert heatmaps.ndim == 4, "heatmaps should be (B,K,H,W)"
+    assert rgb_feats.ndim == 5, "rgb_feats should be (B,K,3,H,W)"
+    B, K, H, W = heatmaps.shape
+    assert rgb_feats.shape[:3] == (B, K, 3), "shapes disagree!"
+
+    # ---- helpers ---------------------------------------------------
+    def to_uint8(arr: np.ndarray) -> np.ndarray:
+        """Normalise arr to 0‑255 uint8 (handles 1‑ or 3‑ch)."""
+        arr = arr - arr.min()
+        arr = arr / (arr.max() + 1e-8)
+        return (arr * 255).round().astype(np.uint8)
+
+    # ---- collect images -------------------------------------------
+    heat_imgs, rgb_imgs = [], []
+
+    for cam in range(K):
+        # ---- heat‑map (grayscale) ---------------------------------
+        hm = heatmaps[0, cam].detach().cpu().numpy()          # (H,W)
+        hm_uint8 = to_uint8(hm)
+        heat_imgs.append(
+            wandb.Image(hm_uint8, mode="L", caption=f"{prefix}‑cam{cam:02d}")
+        )
+
+        # ---- RGB ---------------------------------------------------
+        rgb = rgb_feats[0, cam].detach().cpu().permute(1, 2, 0).numpy()  # (H,W,3)
+        if rgb.max() <= 1.0:                        # assume 0‑1, scale to 0‑255
+            rgb = (rgb * 255).clip(0, 255)
+        rgb_imgs.append(
+            wandb.Image(rgb.astype(np.uint8),
+                        caption=f"{prefix}‑cam{cam:02d}")
+        )
+
+    # ---- log -------------------------------------------------------
+    wandb.log(
+        {
+            f"{prefix}/heatmaps": heat_imgs,
+            f"{prefix}/rgb":      rgb_imgs,
+        },
+        step=step
+    )
+
+def soft_rasterize_batched(points_2d, H, W, sigma=1.0):
+    """
+    Differentiable rasterization for batched, multi-camera 2D points.
+
+    Args:
+        points_2d: (B, K, N, 2)  –  2D points projected by K cameras on B samples.
+        H: height of the output image.
+        W: width of the output image.
+        sigma: Gaussian splat stddev (in pixel units).
+
+    Returns:
+        raster: (B, K, H, W)  –  Rasterized 2D heatmaps per camera and per batch.
+    """
+    B, K, N, _ = points_2d.shape
+    device = points_2d.device
+
+    # Create a pixel grid (H, W)
+    y_grid = torch.arange(H, device=device).view(1, 1, 1, H, 1).float()
+    x_grid = torch.arange(W, device=device).view(1, 1, 1, 1, W).float()
+
+    # Extract x, y and reshape for broadcasting
+    x = points_2d[..., 0].unsqueeze(-1).unsqueeze(-1)  # (B, K, N, 1, 1)
+    y = points_2d[..., 1].unsqueeze(-1).unsqueeze(-1)  # (B, K, N, 1, 1)
+
+    # Compute squared distances to each pixel
+    dist2 = (x_grid - x)**2 + (y_grid - y)**2  # (B, K, N, H, W)
+
+    # Apply Gaussian kernel
+    weights = torch.exp(-dist2 / (2 * sigma**2))  # (B, K, N, H, W)
+
+    # Sum over N points
+    raster = weights.sum(dim=2)  # (B, K, H, W)
+
+    return raster
 
 
 def farthest_point_sampling(xyz, npoint):
@@ -135,7 +341,7 @@ def log_separate_pointclouds(patches, mask_idx, vis_idx, recon, step):
     }, step=step)
 
 
-def log_original_and_recon(patches, mask_idx, vis_idx, recon, step):
+def log_original_and_recon(patches, recon, step):
     """
     patches : Tensor  (P, k, 3)      – original geometry
     mask_idx: Tensor / list (P_mask) – indices of masked patches
@@ -168,22 +374,14 @@ def log_original_and_recon(patches, mask_idx, vis_idx, recon, step):
     orig_xyz   = t2np(patches)                       # (P*k , 3)
     orig_rgb   = paint(orig_xyz, [255, 255, 255])    # white
 
-    # ---------- cloud #2 : visible + recon ------------------------------------
-    vis_xyz    = t2np(patches[vis_idx])              # visible → white
     recon_xyz  = t2np(recon)                         # recon   → blue
-    masked_xyz  = t2np(patches[mask_idx])                         # recon   → blue
-
-    vis_rgb    = paint(vis_xyz,   [255, 255, 255])   # white
     recon_rgb  = paint(recon_xyz, [  255,   100, 100])   # blue
 
-    masked_rgb  = paint(masked_xyz, [  150,   255, 150])   # blue
-
-    comb_rgb   = np.vstack([vis_rgb, recon_rgb, masked_rgb])     # concat (N_total,6)
+    comb_rgb   = np.vstack([orig_rgb, recon_rgb])     # concat (N_total,6)
 
     # ---------- log to W&B -----------------------------------------------------
     wandb.log({
-        "3d/original_all_white"  : obj3d("orig",  orig_rgb),
-        "3d/vis_white_recon_blue": obj3d("comb",  comb_rgb),
+        "3d/comp" : obj3d("orig",  comb_rgb),
     }, step=step)
 
 def log_pointcloud_comparison(original, noisy, reconstructed, step):

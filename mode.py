@@ -11,38 +11,185 @@ import numpy as np
 
 from util import farthest_point_sampling, knn_group
 
-class Patchify3D(torch.nn.Module):
-    def __init__(self, num_patches, patch_size):
+from timm import create_model
+
+class CameraPointCloudAutoEncoder(nn.Module):
+    def __init__(self, N, D=256):
         super().__init__()
-        self.num_patches = num_patches
-        self.patch_size = patch_size
+        self.decoder = nn.Sequential(
+            nn.Linear(D, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, N * 3)
+        )
 
-    def forward(self, x):  # x: (B, N, 3)
-        centers = farthest_point_sampling(x, self.num_patches)      # (B, P)
-        patches = knn_group(x, centers, self.patch_size)            # (B, P, k, 3)
-        return patches
+        self.scene_fusion = SceneTokenFusion()
+        self.view_encoder = ViewEncoder()
+        self.projector = LearnableCameraProjector()
+
+    def forward(self, points): # points: (B, N, 3)
+        projections = self.projector(points) # (B, C, N, 2)
+        encoded_views = self.view_encoder(projections) # (B, C, dim)
+        fused_scene = self.scene_fusion(encoded_views) # (B, dim)
+        rec = self.decoder(fused_scene) # (B, N, 3)
+        return rec
 
 
-# class PatchTransformer(nn.Module):
-#     def __init__(self, dim):
-#         super().__init__()
-#
-#         self.dim = dim
-#
-#         self.to_q = nn.Linear(dim, dim)
-#         self.to_k = nn.Linear(dim, dim)
-#         self.to_v = nn.Linear(dim, dim)
-#
-#     def forward(self, tokens):  # tokens: (B, P, dim)
-#         Q = self.to_q(tokens)
-#         K = self.to_k(tokens)
-#         V = self.to_v(tokens)
-#
-#         attn_scores = torch.matmul(Q, K.transpose(-2,-1)) / self.dim ** 0.5
-#         attn_weights = F.softmax(attn_scores, dim=-1)
-#
-#         out = torch.matmul(attn_weights, V)
-#         return out
+class SceneTokenFusion(nn.Module):
+    def __init__(
+        self,
+        D_in: int = 256,
+        D_model: int = 256,
+        pose_dim: int = 6,
+        n_heads: int = 8,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+
+        # --- 1.  Pose → embedding  -------------------------------------------------
+        self.pose_mlp = nn.Sequential(
+            nn.Linear(pose_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, D_in),
+        )
+
+        # --- 2.  Optional projection to common model dim --------------------------
+        self.cam_proj = (
+            nn.Identity() if D_in == D_model else nn.Linear(D_in, D_model, bias=False)
+        )
+
+        # --- 3.  Learnable scene token  -------------------------------------------
+        self.scene_token = nn.Parameter(torch.randn(1, 1, D_model) / D_model**0.5)
+
+        # --- 4.  Multi‑head cross‑attention  --------------------------------------
+        self.attn = nn.MultiheadAttention(
+            embed_dim=D_model, num_heads=n_heads, batch_first=True
+        )
+
+    def forward(self, cam_feat: torch.Tensor, cam_pose: torch.Tensor) -> torch.Tensor:
+        B, K, _ = cam_feat.shape
+
+        # 1) add pose‑conditioned bias  (geometry awareness)
+        pose_emb = self.pose_mlp(cam_pose)            # (B, K, D_in)
+        feat     = cam_feat + pose_emb                # (B, K, D_in)
+
+        # 2) project to attention dimension
+        feat = self.cam_proj(feat)                    # (B, K, D_model)
+
+        # 3) replicate the learnable query for the minibatch
+        q = self.scene_token.expand(B, -1, -1)        # (B, 1, D_model)
+
+        # 4) cross‑attention   (query = scene token, key/value = cameras)
+        z, _ = self.attn(q, feat, feat)               # (B, 1, D_model)
+
+        return z.squeeze(1)                           # (B, D_model)
+
+
+class ViewEncoder(nn.Module):
+    def __init__(self, d_token=256):
+        super().__init__()
+        self.backbone = create_model(
+            'mobilevit_s', pretrained=True, features_only=True
+        )                       # returns 5 feature maps
+        self.stage_id = 3       # pick 0‑4; 3 ⇒ (BK, 64, 14, 14)
+
+        C = 64                  # channels of chosen stage
+        self.proj = nn.Linear(C, d_token, bias=False)
+
+        # single learnable query that will pull info out of the view
+        self.query = nn.Parameter(torch.randn(1, 1, d_token) / d_token**0.5)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_token, num_heads=8, batch_first=True
+        )
+
+    def forward(self, x):           # x: (B, K, H, W)  1‑channel raster
+        B, K, H, W = x.shape
+        x = x.unsqueeze(2).repeat(1, 1, 3, 1, 1)      # → fake RGB
+        x = x.view(B * K, 3, H, W)
+
+        feats = self.backbone(x)[self.stage_id]        # (BK, C, H', W')
+        BK, C, Hs, Ws = feats.shape
+        S = Hs * Ws
+
+        feats = feats.view(BK, C, S).permute(0, 2, 1)  # (BK, S, C)
+        feats = self.proj(feats)                       # (BK, S, D)
+
+        # tile query to batch‑size
+        q = self.query.expand(BK, -1, -1)              # (BK, 1, D)
+        z, _ = self.attn(q, feats, feats)              # (BK, 1, D)
+        z = z.squeeze(1).view(B, K, -1)                # (B, K, D)
+
+        return z                                       # latent per view
+
+
+class LearnableCameraProjector(nn.Module):
+    def __init__(self, K):
+        super().__init__()
+        self.K = K
+
+        # Learnable rotation vectors (Lie algebra, axis-angle)
+        self.rotvecs = nn.Parameter(torch.randn(K, 3) * 0.01)
+
+        # Learnable translations (camera positions)
+        self.trans = nn.Parameter(torch.randn(K, 3) * 0.01)
+
+        # Learnable focal lengths (shared fx = fy)
+        self.focal = nn.Parameter(torch.ones(K) * 1.5)
+
+
+    def forward(self, points):  # points: (B, N, 3)
+        B, N, _ = points.shape
+        device = points.device
+
+        # Expand points to (B, K, N, 3)
+        points = points.unsqueeze(1).expand(B, self.K, N, 3)  # (B, K, N, 3)
+
+        # Rotation matrices: (K, 3, 3)
+        R = self._so3_exp_map(self.rotvecs)  # (K, 3, 3)
+
+        # Transform points: apply (R * (x - t))
+        R = R.unsqueeze(0)           # (1, K, 3, 3)
+        t = self.trans.unsqueeze(0) # (1, K, 3)
+        points_local = torch.matmul(R, (points - t.unsqueeze(2)).unsqueeze(-1))  # (B, K, N, 3, 1)
+        points_local = points_local.squeeze(-1)  # (B, K, N, 3)
+
+        # Apply perspective projection
+        x = points_local[..., 0]
+        y = points_local[..., 1]
+        z = points_local[..., 2].clamp(min=1e-4)  # prevent divide-by-zero
+
+        f = self.focal.view(1, self.K, 1)  # (1, K, 1)
+        x_proj = f * (x / z)
+        y_proj = f * (y / z)
+
+        projected = torch.stack([x_proj, y_proj], dim=-1)  # (B, K, N, 2)
+        return projected
+
+    def _so3_exp_map(self, rotvecs):
+        """
+        Convert axis-angle vectors (K, 3) to rotation matrices (K, 3, 3)
+        using Rodrigues' rotation formula.
+        """
+        theta = rotvecs.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        k = rotvecs / theta
+
+        K = torch.zeros(rotvecs.shape[0], 3, 3, device=rotvecs.device)
+        K[:, 0, 1] = -k[:, 2]
+        K[:, 0, 2] =  k[:, 1]
+        K[:, 1, 0] =  k[:, 2]
+        K[:, 1, 2] = -k[:, 0]
+        K[:, 2, 0] = -k[:, 1]
+        K[:, 2, 1] =  k[:, 0]
+
+        I = torch.eye(3, device=rotvecs.device).unsqueeze(0)
+        R = I + torch.sin(theta).unsqueeze(-1) * K + (1 - torch.cos(theta).unsqueeze(-1)) * torch.matmul(K, K)
+        return R
+
+
+
+
 
 class FourierPosEnc(nn.Module):
     def __init__(self, dim_out, num_freqs=10):
